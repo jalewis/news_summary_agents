@@ -1,0 +1,16 @@
+research_task:
+    description: 'Find the latest news articles related to {topic} using the keywords {keywords}.'
+    expected_output: str
+
+rank_article_task:
+    description: 'Rank this article from 0 to 1 on usefulness and 0 to 1 on urgency, 0 being not useful or urgent and 1 being very useful and urgent: {article_content}'
+    expected_output: ArticleSummary
+
+summarize_article_task:
+  description: "Summarize the following article: {article_content}"
+  expected_output: ArticleSummary
+
+global_summary_task:
+  description: "Create a high-level summary of the following summarized articles: {summarized_articles}"
+  expected_output: str
+

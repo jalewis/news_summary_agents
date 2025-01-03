@@ -1,0 +1,14 @@
+PyYAML
+requests
+feedparser
+beautifulsoup4
+crewai
+sentence-transformers
+numpy
+scipy
+tavily-python
+google-search-results
+langchain
+transformers
+torch
+langchain-ollama

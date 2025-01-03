@@ -1,0 +1,90 @@
+# System-wide logging level
+log_level: INFO # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# Search engines configurations
+search_engines:
+  serp:
+    enabled: true
+    api_key: "5e3030d1c759caab96f9cdb38d4628501a18b954" # Or empty string if not needed
+  exa:
+    enabled: true
+    api_key: "1bfa6432-d2df-4c9e-a9d6-06146430185e" # Or empty string if not needed
+  duckduckgo:
+    enabled: false
+    api_key: "" # DuckDuckGo doesn't use API keys
+  tavily:
+    enabled: false
+    api_key: "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"
+
+# Email settings
+email:
+  smtp_server: "192.168.120.10"  # Example: "smtp.example.com"
+  smtp_port: 25  # Standard SMTP port
+  from_address: "alert@packetnexus.com"
+  subject: "Daily News Summary"
+  to_addresses:
+    - "jlewis@packetnexus.com"
+  #  - "recipient2@example.com"
+
+# Ollama configurations
+ollama:
+  llm_model: "research-mistral-nemo:latest"
+  embedding_model: "all-MiniLM-L6-v2"
+  base_url: "http://192.168.120.141:11434"
+
+
+# Task configurations
+task:
+  top_topics:
+    - topic: "AI Security"
+      keywords:
+          - "AI security"
+          - "artificial intelligence security"
+          - "machine learning security"
+          - "deep learning security"
+          - "AI vulnerabilities"
+          - "AI threats"
+    - topic: "Cyber Security"
+      keywords:
+        - "cyber security"
+        - "information security"
+        - "network security"
+        - "cyber threats"
+        - "security breach"
+        - "cyber attack"
+    - topic: "AI News"
+      keywords:
+        - "artificial intelligence news"
+        - "AI advancements"
+        - "machine learning research"
+        - "deep learning updates"
+        - "neural networks"
+        - "generative AI"
+    - topic: "New Vulnerabilities"
+      keywords:
+        - "new vulnerabilities"
+        - "zero-day exploits"
+        - "software vulnerabilities"
+        - "security flaws"
+        - "vulnerability disclosure"
+        - "patch management"
+    - topic: "Top Threats"
+      keywords:
+        - "top threats"
+        - "emerging cyber threats"
+        - "cybersecurity risks"
+        - "security trends"
+        - "latest cyberattacks"
+        - "threat landscape"
+    - topic: "Threat Actors"
+      keywords:
+        - "threat actors"
+        - "APT groups"
+        - "cybercriminal groups"
+        - "state-sponsored hackers"
+        - "hacktivists"
+        - "cyber warfare"
+
+  rss_feeds:
+    - "http://157.230.0.167:5500/api/query.php?user=jlewis&t=2N7Zn9sdqHSHQpyjAfG2DV&f=rss"
+    - "http://157.230.0.167:5500/api/query.php?user=jlewis&t=Jev7kfuh8yl21zJFqcIzj&f=rss"

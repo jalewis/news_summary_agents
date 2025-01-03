@@ -1,0 +1,13 @@
+
+services:
+  news_agents:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: news_agents
+    volumes:
+      - ./config:/app/config
+    env_file:
+      - .env  # Load environment variables from .env file
+    environment:
+        CRON_SCHEDULE: "0 7 * * *" # Set the cron schedule here

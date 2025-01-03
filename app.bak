@@ -1,0 +1,724 @@
+import streamlit as st
+import os
+import logging
+from datetime import datetime
+import yaml
+import traceback
+import ollama
+
+from crewai import Agent, Task, Crew, Process
+from crewai_tools import SerperDevTool
+from dotenv import load_dotenv
+from langchain.tools import Tool
+from langchain_community.llms import Ollama
+from langchain.memory import ConversationBufferMemory
+from langchain_community.embeddings import FastEmbedEmbeddings
+from weasyprint import HTML
+import json
+import re
+from bs4 import BeautifulSoup
+from tempfile import NamedTemporaryFile
+
+os.environ["LANGCHAIN_OPENAI_API_KEY"] = "disabled"
+# Disable OpenAI API
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["OPENAI_API_BASE"] = ""
+
+os.environ["OTEL_SDK_DISABLED"] = "true"
+os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "True"
+
+
+# Use FastEmbedEmbeddings or a custom embedding function
+embedding_function = FastEmbedEmbeddings()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('crew_research.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class ConfigManager:
+    @staticmethod
+    def load_config(filepath):
+        try:
+            with open(filepath, 'r') as file:
+                return yaml.safe_load(file)
+        except Exception as e:
+            logger.error(f"Error loading config {filepath}: {e}")
+            st.error(f"Configuration load error: {e}")
+            return None
+
+    @staticmethod
+    def validate_config(config):
+        required_keys = ['role', 'goal', 'backstory']
+        if not config:
+            return False
+        for agent in config.values():
+            if not all(key in agent for key in required_keys):
+                return False
+        return True
+
+class LLMFactory:
+    @staticmethod
+    def create_llm(config=None):
+        try:
+            return Ollama(
+                base_url=os.getenv('OLLAMA_BASE_URL', 'http://192.168.120.141:11434'),
+                model=os.getenv('OLLAMA_MODEL', 'research-mistral-nemo:latest'),
+                temperature="0.1"
+            )
+        except Exception as e:
+            logger.error(f"LLM initialization error: {e}")
+            raise
+
+def create_agent_status_component():
+    """Creates the HTML/CSS for the agent status component"""
+    return """
+    <div class="agent-status">
+        <h3 style="color: #2c3e50;">Agent Status</h3>
+        <div class="status-grid" style="display: grid; grid-template-columns: auto 1fr; gap: 10px; margin-top: 10px;">
+            <div style="font-weight: bold;">Researcher:</div>
+            <div id="researcher-status">Waiting...</div>
+            
+            <div style="font-weight: bold;">Writer:</div>
+            <div id="writer-status">Waiting...</div>
+            
+            <div style="font-weight: bold;">Proofreader:</div>
+            <div id="proofreader-status">Waiting...</div>
+            
+            <div style="font-weight: bold;">File Writer:</div>
+            <div id="file-writer-status">Waiting...</div>
+        </div>
+    </div>
+    """
+
+class ResearchCrew:
+    @property
+    def save_file_tool(self):
+        return Tool(
+            name="save_file",
+            description="Save the formatted report to a file",
+            func=lambda content, filename=None: save_file_utility(content, topic=self.topic, filename=filename)
+        )
+
+    def __init__(self, topic, agents_config, tasks_config, llm):
+        self.topic = topic
+        self.agents_config = agents_config
+        self.tasks_config = tasks_config
+        self.llm = llm
+        self.agent_status = {
+            'researcher': 'Waiting...',
+            'writer': 'Waiting...',
+            'proofreader': 'Waiting...',
+            'file_writer': 'Waiting...'
+        }
+        self.status_container = None
+        self.debug = True
+
+    def log_content(self, stage, content):
+        """Log content at each stage for debugging"""
+        if self.debug:
+            logger.info(f"\n{'='*50}\nContent at {stage}:\n{str(content)[:500]}...\n{'='*50}\n")
+
+    def update_agent_status(self, agent_type, status):
+        """Update the status of an agent and refresh the UI"""
+        self.agent_status[agent_type] = status
+        if self.status_container:
+            with self.status_container.container():
+                st.markdown("### Agent Status")
+                st.markdown("---")
+                for agent, current_status in self.agent_status.items():
+                    col1, col2 = st.columns([1, 2])
+                    with col1:
+                        st.write(f"**{agent.title()}:**")
+                    with col2:
+                        status_color = self.get_status_color(current_status)
+                        st.markdown(
+                            f'<div style="background-color: {status_color}; color: white; '
+                            f'padding: 4px 12px; border-radius: 4px; display: inline-block; '
+                            f'font-size: 14px;">{current_status}</div>',
+                            unsafe_allow_html=True
+                        )
+
+    @staticmethod
+    def get_status_color(status):
+        """Get the color for a given status"""
+        status_colors = {
+            'Waiting...': '#6c757d',      # Gray
+            'Initializing...': '#17a2b8',  # Info blue
+            'Working...': '#007bff',       # Primary blue
+            'Complete ✓': '#28a745',       # Success green
+            'Failed ✗': '#dc3545'          # Danger red
+        }
+        return status_colors.get(status, '#6c757d')
+
+    def extract_html_content(self, content):
+        """Extract HTML content from between triple backticks"""
+        if '```html' in content:
+            # Split by ```html and take everything after it
+            html_part = content.split('```html')[1]
+            # Split by ``` and take everything before it
+            html_content = html_part.split('```')[0]
+            return html_content.strip()
+        return content
+
+
+    def create_agent(self, agent_type):
+        """Create an agent with the specified type"""
+        config = self.agents_config.get(agent_type, {})
+        if not config:
+            logger.error(f"Missing configuration for agent type: {agent_type}")
+            raise ValueError(f"Agent configuration not found: {agent_type}")
+        
+        verbose = isinstance(config.get('verbose'), bool) and config.get('verbose')
+        allow_delegation = isinstance(config.get('allow_delegation'), bool) and config.get('allow_delegation')
+        
+        tools = []
+        if agent_type == 'researcher':
+            tools = [SerperDevTool()]
+        elif agent_type == 'file_writer':
+            tools = [self.save_file_tool]
+        
+        return Agent(
+            role=str(config.get('role', '')).strip(),
+            goal=f"{str(config.get('goal', '')).strip()} for {self.topic}",
+            backstory=str(config.get('backstory', '')).strip(),
+            verbose=verbose,
+            allow_delegation=allow_delegation,
+            tools=tools,
+            llm=self.llm,
+            enable_telemetry=False
+        )
+
+    def create_task(self, task_type, agent):
+        """Create a task for the specified agent"""
+        config = self.tasks_config.get(task_type, {})
+        if not config:
+            logger.error(f"Missing configuration for task type: {task_type}")
+            raise ValueError(f"Task configuration not found: {task_type}")
+            
+        description = config.get('description', '').replace('[TOPIC]', self.topic)
+        expected_output = config.get('expected_output', '').replace('[TOPIC]', self.topic)
+        
+        return Task(
+            description=description,
+            expected_output=expected_output,
+            agent=agent
+        )
+
+    def create_json_content(self, html_content):
+        """Create structured JSON content from HTML"""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            sections = {}
+            current_section = None
+            
+            for element in soup.find_all(['h1', 'h2', 'p']):
+                if element.name == 'h2':
+                    current_section = element.text.strip()
+                    sections[current_section] = []
+                elif current_section and element.name == 'p':
+                    sections[current_section].append(element.text.strip())
+            
+            return {
+                "title": soup.title.string if soup.title else f"{self.topic} Report",
+                "sections": sections,
+                "metadata": {
+                    "topic": self.topic,
+                    "generated": datetime.now().isoformat()
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error creating JSON content: {e}")
+            return {
+                "error": "Failed to create structured content",
+                "raw_content": html_content
+            }
+    
+    def execute(self, status_container):
+        """Execute the research process with content tracing"""
+        try:
+            self.status_container = status_container
+            
+            # Research phase
+            logger.info("\n=== Starting Research Phase ===")
+            self.update_agent_status('researcher', 'Working...')
+            researcher = self.create_agent('researcher')
+            research_task = self.create_task('research_task', researcher)
+            
+            logger.info(f"Research task description: {research_task.description}")
+            logger.info("Expected output defined in tasks.yaml:")
+            logger.info(f"{self.tasks_config['research_task']['expected_output']}")
+            
+            research_result = research_task.execute()
+            
+            # Log full research output for analysis
+            logger.info("\n=== Research Results ===")
+            logger.info(f"Research result type: {type(research_result)}")
+            logger.info(f"Research result length: {len(str(research_result))}")
+            logger.info("\nFull research output:")
+            logger.info(research_result)
+                
+            # Writing phase
+            logger.info("\n=== Starting Writing Phase ===")
+            self.update_agent_status('writer', 'Working...')
+            writer = self.create_agent('writer')
+            writing_task = self.create_task('writing_task', writer)
+            
+            # Log how research is being passed to writer
+            logger.info("\n=== Passing Research to Writer ===")
+            if isinstance(research_result, str):
+                logger.info("Research result is string, appending to task description")
+                writing_task.description = f"{self.tasks_config['writing_task']['description']}\n\nResearch Content:\n{research_result}"
+            else:
+                logger.warning(f"Research result is not string, got type: {type(research_result)}")
+                logger.warning("Research content may not be properly passed to writer")
+                
+            logger.info(f"Writer task description length: {len(writing_task.description)}")
+            logger.info("Writer task description:")
+            logger.info(writing_task.description)
+            
+            writing_result = writing_task.execute()
+            logger.info("\n=== Writing Results ===")
+            logger.info(f"Writing result type: {type(writing_result)}")
+            logger.info(f"Writing result length: {len(str(writing_result))}")
+            logger.info("Full writing output:")
+            logger.info(writing_result)
+            
+            self.log_content('Writing', writing_result)
+            self.update_agent_status('writer', 'Complete ✓')
+
+            # Proofreading phase
+            logger.info("\n=== Starting Proofreading Phase ===")
+            self.update_agent_status('proofreader', 'Working...')
+            proofreader = self.create_agent('proofreader')
+            proofreading_task = self.create_task('proofreading_task', proofreader)
+            
+            # Pass the writing result to the proofreader
+            if isinstance(writing_result, str):
+                logger.info("Writing result is string, passing to proofreader")
+                proofreading_task.description = f"{self.tasks_config['proofreading_task']['description']}\n\nContent to Proofread:\n{writing_result}"
+            else:
+                logger.warning(f"Writing result is not string, got type: {type(writing_result)}")
+                
+            logger.info("Proofreading task description:")
+            logger.info(proofreading_task.description)
+            
+            proofreading_result = proofreading_task.execute()
+            logger.info("\n=== Proofreading Results ===")
+            logger.info(f"Proofreading result type: {type(proofreading_result)}")
+            logger.info(f"Proofreading result length: {len(str(proofreading_result))}")
+            logger.info("Full proofreading output:")
+            logger.info(proofreading_result)
+            
+            self.log_content('Proofreading', proofreading_result)
+            self.update_agent_status('proofreader', 'Complete ✓')
+
+            # File writing phase
+            logger.info("\n=== Starting File Writing Phase ===")
+            self.update_agent_status('file_writer', 'Working...')
+            file_writer = self.create_agent('file_writer')
+            file_writing_task = self.create_task('file_writing_task', file_writer)
+            
+            # Create the formatted content dictionary
+            html_content = self.extract_html_content(proofreading_result)
+            formatted_content = {
+                'html': html_content,
+                'json': self.create_json_content(html_content),
+                'pdf': html_content
+            }
+            
+            logger.info("\n=== Formatted Content Created ===")
+            logger.info(f"Formatted content type: {type(formatted_content)}")
+            logger.info("Formatted content structure:")
+            logger.info(json.dumps(formatted_content, indent=2))
+            
+            self.log_content('Formatted Content', formatted_content)
+            
+            # Pass the formatted content to the file writer
+            if formatted_content:
+                file_writing_task.description = f"{self.tasks_config['file_writing_task']['description']}\n\nContent to Save:\n{json.dumps(formatted_content)}"
+            
+            logger.info("File writing task description:")
+            logger.info(file_writing_task.description)
+            
+            final_result = file_writing_task.execute()
+            logger.info("\n=== File Writing Results ===")
+            logger.info(f"Final result type: {type(final_result)}")
+            logger.info("Final result:")
+            logger.info(final_result)
+            
+            self.log_content('File Writing', final_result)
+            self.update_agent_status('file_writer', 'Complete ✓')
+
+            # Log content flow analysis
+            logger.info("\n=== Content Flow Analysis ===")
+            logger.info(f"Research content length: {len(str(research_result))}")
+            logger.info(f"Writing content length: {len(str(writing_result))}")
+            logger.info(f"Proofreading content length: {len(str(proofreading_result))}")
+            logger.info(f"Final content length: {len(str(final_result))}")
+
+            # Check for content preservation
+            if "No information found" in str(writing_result):
+                logger.warning("\n=== Content Loss Detection ===")
+                original_sections = [s for s in research_result.split('\n\n') if s.strip()]
+                final_sections = [s for s in writing_result.split('\n') if s.strip()]
+                logger.warning("Sections marked as 'No information found' but had content in research:")
+                for section in original_sections:
+                    if section and "No information found" in writing_result:
+                        logger.warning(f"Lost content in section: {section[:100]}...")
+
+            return formatted_content
+                
+        except Exception as e:
+            logger.error(f"Research crew execution error: {traceback.format_exc()}")
+            # Mark any working tasks as failed
+            for agent_type in self.agent_status:
+                if self.agent_status[agent_type] in ['Working...', 'Initializing...']:
+                    self.update_agent_status(agent_type, 'Failed ✗')
+            raise
+
+    
+ 
+def create_agent_status_html(status_dict):
+    """Creates the HTML for the agent status component"""
+    status_colors = {
+        'Waiting...': '#6c757d',      # Gray
+        'Initializing...': '#17a2b8', # Info blue
+        'Working...': '#007bff',      # Primary blue
+        'Complete ✓': '#28a745',      # Success green
+        'Failed ✗': '#dc3545'         # Danger red
+    }
+    
+    html = """
+    <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin: 10px 0;">
+        <h3 style="color: #2c3e50; margin-bottom: 15px;">Agent Status</h3>
+        <div style="display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center;">
+    """
+    
+    for agent, status in status_dict.items():
+        status_color = status_colors.get(status, '#6c757d')
+        html += f"""
+            <div style="font-weight: bold; color: #2c3e50;">{agent.title()}:</div>
+            <div style="background-color: {status_color}; color: white; padding: 5px 10px; border-radius: 4px; display: inline-block;">
+                {status}
+            </div>
+        """
+    
+    html += """
+        </div>
+    </div>
+    """
+    
+    return html
+
+def save_file_utility(content, topic=None, file_format=None, filename=None):
+    """Save content to a file with proper format handling"""
+    try:
+        # Use the Docker volume mount path
+        reports_dir = '/reports'
+        os.makedirs(reports_dir, exist_ok=True)
+        
+        # Generate a safe filename if not provided
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_topic = re.sub(r'[^a-zA-Z0-9_-]', '_', topic) if topic else 'report'
+            filename = f"{safe_topic}_{timestamp}.{file_format}"
+        else:
+            # Ensure filename is safe and has correct extension
+            safe_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', os.path.basename(filename))
+            if not safe_filename.endswith(f'.{file_format}'):
+                safe_filename = f"{safe_filename}.{file_format}"
+            filename = safe_filename
+
+        # Create full filepath
+        filepath = os.path.join(reports_dir, filename)
+        logger.info(f"Saving {file_format} file to: {filepath}")
+
+        # Save content based on format
+        if file_format == 'json':
+            json_content = content
+            if isinstance(content, str):
+                try:
+                    json_content = json.loads(content)
+                except json.JSONDecodeError:
+                    json_content = {"content": content}
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(json_content, f, indent=2)
+                
+        elif file_format == 'pdf':
+            # Create a temporary HTML file for PDF conversion
+            with NamedTemporaryFile(mode='w', suffix='.html', delete=False) as temp_html:
+                temp_html.write(content)
+                temp_html.flush()
+                
+                # Convert to PDF
+                HTML(filename=temp_html.name).write_pdf(filepath)
+                
+                # Clean up temporary file
+                os.unlink(temp_html.name)
+                
+        else:  # html
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+        logger.info(f"Successfully saved file: {filepath}")
+        return filepath
+        
+    except Exception as e:
+        logger.error(f"Error saving {file_format} file: {str(e)}")
+        st.error(f"Error saving file: {str(e)}")
+        return None
+
+def save_report(result, topic):
+    """Save the report in multiple formats"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_topic = re.sub(r'[^a-zA-Z0-9_-]', '_', topic)
+        files = {}
+
+        # Handle the result content
+        if isinstance(result, str):
+            # Check if it's a description instead of actual content
+            if 'Here is the complete content' in result or '```' in result:
+                logger.error("Received description instead of actual content")
+                st.error("Error: Report generation failed - received description instead of content")
+                return {}
+
+            html_content = result
+            
+            # Create JSON structure from HTML
+            try:
+                soup = BeautifulSoup(result, 'html.parser')
+                sections = {}
+                current_section = None
+                
+                for element in soup.find_all(['h1', 'h2', 'p']):
+                    if element.name == 'h2':
+                        current_section = element.text.strip()
+                        sections[current_section] = []
+                    elif current_section and element.name == 'p':
+                        sections[current_section].append(element.text.strip())
+                
+                json_content = {
+                    "title": soup.title.string if soup.title else f"{topic} Report",
+                    "sections": sections,
+                    "metadata": {
+                        "topic": topic,
+                        "generated": timestamp
+                    }
+                }
+            except Exception as e:
+                logger.warning(f"Error parsing HTML for JSON: {e}")
+                json_content = {
+                    "content": result,
+                    "metadata": {
+                        "topic": topic,
+                        "generated": timestamp
+                    }
+                }
+                
+        elif isinstance(result, dict):
+            if 'Here is the complete content' in str(result) or '```' in str(result):
+                logger.error("Received description instead of actual content")
+                st.error("Error: Report generation failed - received description instead of content")
+                return {}
+
+            html_content = result.get('html', '')
+            json_content = result.get('json', {})
+            
+        else:
+            raise ValueError(f"Unsupported result type: {type(result)}")
+
+        if not html_content or html_content.isspace():
+            raise ValueError("Empty or invalid HTML content")
+
+        # Save HTML
+        html_filename = f"{safe_topic}_{timestamp}.html"
+        files['html'] = save_file_utility(
+            html_content,
+            topic,
+            'html',
+            html_filename
+        )
+
+        # Save JSON
+        json_filename = f"{safe_topic}_{timestamp}.json"
+        files['json'] = save_file_utility(
+            json_content,
+            topic,
+            'json',
+            json_filename
+        )
+
+        # Save PDF
+        pdf_filename = f"{safe_topic}_{timestamp}.pdf"
+        files['pdf'] = save_file_utility(
+            html_content,
+            topic,
+            'pdf',
+            pdf_filename
+        )
+
+        # Verify files were saved
+        files = {k: v for k, v in files.items() if v is not None}
+        if not files:
+            raise Exception("No files were successfully saved")
+
+        return files
+
+    except Exception as e:
+        logger.error(f"Error in save_report: {str(e)}")
+        st.error(f"Error saving report: {str(e)}")
+        return {}
+
+
+def check_old_files(hours=1):
+    """Check for files older than specified hours and return their info"""
+    old_files = []
+    try:
+        reports_dir = '/reports'
+        if os.path.exists(reports_dir):
+            current_time = datetime.now()
+            for filename in os.listdir(reports_dir):
+                filepath = os.path.join(reports_dir, filename)
+                file_modified_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                time_diff = (current_time - file_modified_time).total_seconds() / 3600  # Convert to hours
+                
+                if time_diff > hours:
+                    old_files.append({
+                        'filename': filename,
+                        'path': filepath,
+                        'modified': file_modified_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'age_hours': round(time_diff, 2)
+                    })
+    except Exception as e:
+        logger.warning(f"Error checking old files: {e}")
+    
+    return old_files
+
+
+
+def reset_app_state(check_files=True):
+    """Reset all app state variables and report on old files"""
+    # Clear Streamlit caches if any exist
+    if hasattr(st, 'session_state'):
+        keys_to_keep = ['user_settings', 'config']  # Keep any persistent settings
+        for key in list(st.session_state.keys()):
+            if key not in keys_to_keep:
+                del st.session_state[key]
+    
+    # Reset any global variables or caches
+    if 'memory' in globals():
+        globals()['memory'].clear()
+    
+    # Check for old files if enabled
+    if check_files:
+        old_files = check_old_files()
+        if old_files:
+            return old_files
+    
+    return None
+
+def main():
+    st.set_page_config(
+        page_title="ThreatShare.AI Research Team", 
+        page_icon="",
+        layout="wide"
+    )
+    st.title("🔍 ThreatShare.AI Research Team")
+
+    # Load configurations
+    agents_config = ConfigManager.load_config('config/agents.yaml')
+    tasks_config = ConfigManager.load_config('config/tasks.yaml')
+
+    if not (agents_config and tasks_config):
+        st.error("Configuration error. Cannot proceed.")
+        return
+
+    # Topic input with validation
+    topic = st.text_input(
+        "Research Topic", 
+        placeholder="Enter a Threat Actor (e.g., 'Salt Typhoon', 'Lazarus Group', 'APT29')",
+        help="Provide a specific Threat Actor for a comprehensive report"
+    )
+
+    if st.button("Generate Report"):
+        if not topic:
+            st.warning("Please enter a research topic")
+            return
+
+        # Create a status container
+        status_container = st.empty()
+        
+        try:
+            # Initialize LLM and Research Crew
+            llm = LLMFactory.create_llm()
+            research_crew = ResearchCrew(topic, agents_config, tasks_config, llm)
+
+            # Run research with status container
+            with st.spinner('Generating report...'):
+                result = research_crew.execute(status_container)
+                
+                if result:
+                    # Save reports in different formats
+                    files = save_report(result, topic)
+                    
+                    if files:
+                        st.success("Reports generated successfully!")
+                        
+                        # Create columns for download buttons
+                        col1, col2, col3 = st.columns(3)
+                        
+                        # Download buttons for each format
+                        for format_type, filepath in files.items():
+                            if filepath and os.path.exists(filepath):
+                                with open(filepath, 'rb') as file:
+                                    file_content = file.read()
+                                    if format_type == 'html':
+                                        col1.download_button(
+                                            label="Download HTML",
+                                            data=file_content,
+                                            file_name=f"{topic.replace(' ', '_')}.html",
+                                            mime="text/html"
+                                        )
+                                    elif format_type == 'json':
+                                        col2.download_button(
+                                            label="Download JSON",
+                                            data=file_content,
+                                            file_name=f"{topic.replace(' ', '_')}.json",
+                                            mime="application/json"
+                                        )
+                                    elif format_type == 'pdf':
+                                        col3.download_button(
+                                            label="Download PDF",
+                                            data=file_content,
+                                            file_name=f"{topic.replace(' ', '_')}.pdf",
+                                            mime="application/pdf"
+                                        )
+                        
+                        # Display report preview
+                        st.subheader("Report Preview")
+                        if 'html' in files:
+                            with open(files['html'], 'r', encoding='utf-8') as f:
+                                st.components.v1.html(f.read(), height=800, scrolling=True)
+                    else:
+                        st.error("Failed to save report files")
+                else:
+                    st.error("No report content generated")
+
+        except Exception as e:
+            logger.error(f"Research generation error: {traceback.format_exc()}")
+            st.error(f"An unexpected error occurred: {e}")
+            st.error("Please check the logs for more details")
+
+
+if __name__ == "__main__":
+    main()
+
