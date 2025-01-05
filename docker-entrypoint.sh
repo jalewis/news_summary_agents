@@ -1,17 +1,14 @@
 #!/bin/bash
-# Set the cron schedule from the environment variable or a default one
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 7 * * *}"  # Default to daily at midnight
-# Generate the cron string from the environment variable
-CRON_STRING="$CRON_SCHEDULE python /app/app.py"
+set -e
 
-# Redirect output and error to /dev/null to avoid cron emails
-echo "$CRON_STRING > /dev/null 2>&1" > /app/cron.txt
+# Setup cron job
+if [ ! -z "$CRON_SCHEDULE" ]; then
+    echo "Setting up cron schedule: $CRON_SCHEDULE"
+    echo "$CRON_SCHEDULE /usr/local/bin/python /app/app.py >> /app/logs/cron.log 2>&1" | crontab -
+else
+    echo "Error: CRON_SCHEDULE environment variable not set"
+    exit 1
+fi
 
-# Add cron tasks
-crontab /app/cron.txt
-
-# Start the cron daemon
-/usr/sbin/cron -f
-
-# Keep the container running
-tail -f /dev/null
+# Start cron in foreground
+cron -f

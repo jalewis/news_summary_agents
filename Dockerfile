@@ -31,3 +31,10 @@ ENTRYPOINT ["/bin/bash", "-c", "tail -f /dev/null"]
 # you need to pass CRON_SCHEDULE from the env var
 # Add execute permission to docker-entrypoint.sh
 RUN chmod +x docker-entrypoint.sh
+
+# Create log directory
+RUN mkdir -p /app/logs && \
+    chown -R appuser:appuser /app/logs
+
+# Define volume for logs
+VOLUME ["/app/logs"]

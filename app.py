@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # app.py
 
 # Suppress Pydantic V2 warnings

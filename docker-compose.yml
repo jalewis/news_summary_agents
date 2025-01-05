@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - CRON_SCHEDULE=*/15 * * * *  # Run every 15 minutes
+    healthcheck:
+      test: ["CMD", "ps", "aux", "|", "grep", "cron", "||", "exit", "1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3 
